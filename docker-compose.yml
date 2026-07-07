@@ -1,0 +1,15 @@
+services:
+  vigil-scc:
+    build: .
+    container_name: vigil-scc
+    ports:
+      - "3000:3000"   # Web UI
+      - "3001:3001"   # MCP endpoint
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - MCP_PORT=3001
+      - DB_PATH=/app/data/vigil.db
+    restart: unless-stopped
