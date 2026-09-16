@@ -38,10 +38,10 @@ Claude (AI) ──MCP──► Vigil Server (Node.js)
 
 **Token lifecycle:**
 ```
-PENDING_APPROVAL → APPROVED → RUNNING → COMPLETED
-                ↘ REJECTED
-                              ↘ FAILED
-                                        WAITING_FOR_INPUT
+PENDING_APPROVAL → APPROVED → RUNNING ⇄ WAITING_FOR_INPUT
+                ↘ REJECTED            ↘ COMPLETED
+                                      ↘ FAILED (EXEC_FAILURE | STOPPED | TIMEOUT |
+                                                CONNECTION_ERROR | SESSION_LOST | SERVER_RESTART)
 ```
 
 ---
@@ -65,6 +65,31 @@ which previously caused the sentinel to match prematurely on the command echo.
 Without PTY, `isatty()` returns false so programs output in non-interactive mode —
 desirable for clean parseable output.
 
+**Important execution decision — tracked runs:** Every command runs out of a run
+directory on the remote host (`$VIGIL_REMOTE_DIR/<token_id>-<index>/`, default
+`$HOME/.vigil/runs`) holding a stdin FIFO (`in`), output log (`out`), `exit`, and
+`shell`/`holder` pids. The command still runs in the persistent shell's foreground
+(inside a `__vigil_run` shell function, so cwd/env persist), but its stdout+stderr go
+to `out` (followed with `tail -f` over a side exec channel) and its stdin comes from
+the FIFO. Consequences:
+- Output survives a dropped channel or a Vigil restart → Vigil **reattaches** on
+  startup / reconnect (`QueueManager.init()`, `recoverCommand()`).
+- Input is written to the FIFO over a separate channel, so it can never be executed
+  by the shell (the old "prompt swallows the next queued command" wedge).
+- The run dir path is persisted on the command (`commands[i].remote_run`).
+- If the run dir can't be created, the command falls back to the untracked
+  channel wrapper (no input, no recovery).
+
+**Important stop decision:** There is no timeout by default (`CMD_TIMEOUT_MS=0`).
+Stopping (UI Stop button, `vigil_cancel`, or `timeout_seconds`) sends SIGINT to the
+shell plus SIGINT → SIGTERM → SIGKILL to the shell's descendants (found via `ps`/`/proc`
+from a side channel). While a command runs the shell has `trap 'return 130' INT`, so
+loops and builtins that execute in the shell itself are aborted without killing the
+shell; between commands the shell has `trap : INT`. Only if the command survives
+SIGKILL is the session torn down. **Never release the session lock on timeout** —
+that was the original 30s wedge bug: the command kept running while the next one was
+written into the same shell.
+
 **Important MCP decision:** One `McpServer` instance per transport session.
 The SDK enforces 1:1 between McpServer and transport. `createMcpServer()` is a
 factory in `src/mcp/server.ts`.
@@ -77,20 +102,26 @@ factory in `src/mcp/server.ts`.
 vigil-scc/
 ├── src/
 │   ├── index.ts          Entry point — bootstraps DB, queue, SSH, starts both servers
+│   ├── config.ts         Env-backed config getters (read lazily)
 │   ├── mcp/
 │   │   ├── server.ts     McpServer factory + all tool/resource definitions
 │   │   ├── router.ts     Express router, StreamableHTTP session management
 │   │   └── index.ts      Barrel
 │   ├── ssh/
-│   │   ├── registry.ts   SshRegistry class — connect/disconnect/exec/handleData
-│   │   └── index.ts      Singleton + wires executor into queue
+│   │   ├── registry.ts       SshRegistry (CommandRunner) — maps connection → ShellSession + CommandRun
+│   │   ├── shell-session.ts  ShellSession — ssh2 client + no-PTY shell, handshake, side exec channels
+│   │   ├── command-run.ts    CommandRun — one command's lifecycle: wrapper, tail, stop escalation, stdin probe
+│   │   ├── shell-protocol.ts Pure text written to the shell (handshake, run wrapper) + marker parsers
+│   │   ├── remote-ops.ts     Side-channel helper scripts + parsing (inspect, signal, probe, input, list, cleanup)
+│   │   ├── output-buffer.ts  Capped/decoded command output, prompt extraction
+│   │   └── index.ts          Singleton + wires runner into queue
 │   ├── queue/
 │   │   ├── types.ts      All shared TypeScript interfaces
 │   │   ├── store.ts      SQLite CRUD — tokens, connections, session_events
-│   │   ├── queue.ts      QueueManager (EventEmitter) — enqueue/approve/reject/exec
+│   │   ├── queue.ts      QueueManager (EventEmitter) — enqueue/approve/exec/stop/input/recovery
 │   │   └── index.ts      Barrel
 │   └── api/
-│       └── router.ts     REST API — /api/tokens, /api/connections
+│       └── router.ts     REST API — tokens (approve/reject/stop/input), connections, orphans
 ├── client/               React app (Vite)
 │   └── src/
 │       ├── App.tsx        Main layout, socket.io, state
@@ -98,8 +129,8 @@ vigil-scc/
 │       ├── index.css      Design system (CSS custom properties)
 │       └── components/
 │           ├── Sidebar.tsx       Connection list
-│           ├── TokenCard.tsx     Queue item with approve/reject
-│           └── TokenDetail.tsx   Expanded command output panel
+│           ├── TokenCard.tsx     Queue item with approve/reject/stop
+│           └── TokenDetail.tsx   Live output, Stop, input panel, AI input approvals
 ├── data/                 SQLite DB (gitignored)
 ├── certs/                mkcert TLS certs for HTTPS MCP (gitignored)
 ├── .env                  Local config (copy from .env.example)
@@ -136,6 +167,11 @@ npm run dev          # starts on :5173
 
 **Debug SSH output:** Add `DEBUG_SSH=true` to `.env` to log raw shell data.
 
+**Execution env vars** (see `.env.example`): `CMD_TIMEOUT_MS` (0 = none),
+`INTERRUPT_GRACE_MS`, `INPUT_IDLE_MS`, `OUTPUT_MAX_BYTES`, `VIGIL_REMOTE_DIR`,
+`RECOVERY_TIMEOUT_MS`, `SSH_KEEPALIVE_INTERVAL_MS`, `SSH_KEEPALIVE_COUNT_MAX`,
+`SSH_READY_TIMEOUT_MS`. Env is read lazily (ESM imports run before `dotenv.config()`).
+
 ---
 
 ## MCP Tools (what the AI can call)
@@ -144,13 +180,23 @@ npm run dev          # starts on :5173
 |---|---|
 | `vigil_list_connections` | List registered SSH connections |
 | `vigil_add_connection` | Register a new SSH connection |
-| `vigil_enqueue` | Submit commands for human approval |
-| `vigil_poll` | Check token status and retrieve output |
+| `vigil_enqueue` | Submit commands for human approval (optional per-command `timeout_seconds`) |
+| `vigil_poll` | Check token status, partial output, `waiting_for_input`, `input_mode` |
+| `vigil_wait` | Long-poll (≤50s) until the token changes state |
+| `vigil_send_input` | Send stdin to a running command (needs approval unless `auto_approve`/`auto_approve_input`) |
 | `vigil_queue_status` | View active queue |
-| `vigil_cancel` | Cancel a PENDING_APPROVAL token |
+| `vigil_cancel` | Withdraw a pending/queued token, or stop a running one |
 
 **Polling pattern:** The AI calls `vigil_enqueue`, receives a `token_id`, then
-calls `vigil_poll` every few seconds until `is_terminal: true`.
+calls `vigil_wait` until `is_terminal: true`. If the token is `WAITING_FOR_INPUT`
+and `input_mode` is `requires_approval`, the AI tells the operator what the prompt
+says and what it proposes, then calls `vigil_send_input` (shows as a one-click
+approval in the UI).
+
+**Waiting-for-input detection:** after `INPUT_IDLE_MS` without output, a side-channel
+probe checks whether the shell or a descendant is blocked reading the run's FIFO
+(`/proc/<pid>/fd/0` + `wchan`/`syscall`); falls back to "last output line has no
+newline" when `/proc` is unavailable.
 
 ---
 
@@ -159,15 +205,19 @@ calls `vigil_poll` every few seconds until `is_terminal: true`.
 ```sql
 tokens (
   id, description, status, connection_id, source,
-  commands TEXT (JSON),           -- Command[]
+  commands TEXT (JSON),           -- Command[] (incl. timeout_seconds, remote_run)
   error TEXT (JSON),              -- TokenError | null
   session_mutations TEXT (JSON),  -- SessionMutation[]
+  waiting_for_input TEXT (JSON),  -- { command_index, prompt, recent_output, since } | null
+  input_requests TEXT (JSON),     -- InputRequest[] (PENDING/SENT/REJECTED/EXPIRED/FAILED)
+  recovered INTEGER,              -- reattached after restart / dropped connection
   created_at, updated_at, approved_at, completed_at
 )
 
 connections (
   id, name, host, port, username,
   auth_type TEXT ('key' | 'password'),
+  auto_approve INTEGER, auto_approve_input INTEGER,
   private_key TEXT,   -- PEM content
   password TEXT,
   status, error, created_at, last_connected_at
@@ -185,11 +235,16 @@ session_events (
 
 ## Known Issues / Bugs
 
-- SSH output can be empty or malformed on some shells — see ROADMAP.md for planned improvements
+- The persistent shell must be POSIX-like (bash/zsh/dash); fish is not supported
+- Stop/probe/input rely on `ps` or `/proc`, `mkfifo`, `tail -f` on the host
+- Processes running as root under `sudo` may refuse signals — Stop then ends in a session reset
+- `read -p` prompts aren't printed without a tty, so builtin prompts show no prompt text
+- A command that resets the shell's INT trap (`trap - INT`) makes Stop kill the shell (session reset)
 - No SFTP/file upload support yet
 - No terminal pane (xterm.js installed but not wired)
 - No browser notifications
-- Session state is lost on server restart (SSH sessions are in-memory)
+- On restart / reconnect, shell state (cwd, env) is lost; in-flight runs are reattached but
+  the rest of their batch is not run (`SESSION_LOST`)
 - Connections table stores passwords in plaintext — acceptable for homelab, needs encryption for production
 
 ---
@@ -201,4 +256,10 @@ session_events (
 - Queue events are emitted via `queue` (EventEmitter) and bridged to Socket.io in `index.ts`
 - New SSH connections lazy-connect on first `exec()` call
 - The `QueueManager` uses per-connection FIFOs (`connectionQueues` map) — one batch runs per connection at a time
-- `reconcileStaleTokens()` runs on startup and marks RUNNING/APPROVED tokens as FAILED
+- The queue talks to SSH only through the `CommandRunner` interface (`queue/types.ts`)
+- `index.ts` must call `initSsh()` before `queue.init()`: init reattaches in-flight runs
+- On startup APPROVED tokens are marked FAILED (`reconcileStaleTokens()`); RUNNING/WAITING tokens
+  with a `remote_run` are reattached, others fail with SERVER_RESTART
+- On every connect, finished run dirs no token owns are collected (late results attached to
+  SESSION_LOST tokens) and deleted; live ones are listed at `GET /api/connections/:id/orphans`
+- Never `rm -rf` run dirs — `cleanupRun()` deletes the known files and `rmdir`s

@@ -18,6 +18,7 @@ interface FormState {
   private_key:  string
   password:     string
   auto_approve: boolean
+  auto_approve_input: boolean
 }
 
 type TestState = { status: 'idle' } | { status: 'testing' } | { status: 'ok' } | { status: 'fail'; error: string }
@@ -34,6 +35,7 @@ export function ConnectionModal({ connection, onClose, onSaved }: Props) {
     private_key:  '',
     password:     '',
     auto_approve: connection?.auto_approve ?? false,
+    auto_approve_input: connection?.auto_approve_input ?? false,
   })
 
   const [test,   setTest]   = useState<TestState>({ status: 'idle' })
@@ -96,6 +98,7 @@ export function ConnectionModal({ connection, onClose, onSaved }: Props) {
         username:     form.username,
         auth_type:    form.auth_type,
         auto_approve: form.auto_approve,
+        auto_approve_input: form.auto_approve_input,
       }
       // Only send credentials if provided (edit: leave blank to keep existing).
       if (form.auth_type === 'key'      && form.private_key) body.private_key = form.private_key
@@ -192,6 +195,18 @@ export function ConnectionModal({ connection, onClose, onSaved }: Props) {
               <div>
                 <div className="toggle-label">Auto-approve</div>
                 <div className="toggle-hint">Automatically approve all AI commands for this connection without human review</div>
+              </div>
+            </label>
+          </div>
+
+          <div className="form-field">
+            <label className="toggle-row">
+              <input type="checkbox" checked={form.auto_approve || form.auto_approve_input}
+                disabled={form.auto_approve}
+                onChange={handleInputChange('auto_approve_input')} />
+              <div>
+                <div className="toggle-label">Auto-approve input</div>
+                <div className="toggle-hint">Let the AI answer prompts from running commands (e.g. "Continue? [Y/n]") without approving each response. Implied by auto-approve.</div>
               </div>
             </label>
           </div>

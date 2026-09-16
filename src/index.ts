@@ -22,8 +22,8 @@ const MCP_PORT = parseInt(process.env.MCP_PORT ?? '3001');
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 initDb();
-queue.init();
 initSsh();
+queue.init();   // after initSsh: reattaches to runs that were in flight at shutdown
 
 // ─── Web UI server (port 3000) ────────────────────────────────────────────────
 
@@ -64,10 +64,15 @@ const bridgedEvents = [
   'token:approved',
   'token:rejected',
   'token:started',
+  'token:command:output',
   'token:command:complete',
   'token:completed',
   'token:failed',
   'token:waiting',
+  'token:running',
+  'token:input:requested',
+  'token:input:resolved',
+  'token:recovered',
   'connection:connected',
   'connection:disconnected',
   'connection:error',

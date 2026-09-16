@@ -1,174 +1,235 @@
-import { Client } from 'ssh2';
-import type { ClientChannel, ConnectConfig } from 'ssh2';
 import { EventEmitter } from 'events';
 import {
   getConnection,
   updateConnectionStatus,
 } from '../queue/store.js';
-import type { CommandResult } from '../queue/types.js';
+import { RunDetachedError } from '../queue/types.js';
+import type {
+  CommandRunner,
+  ExecOptions,
+  ExecResult,
+  RemoteRun,
+  RemoteRunInfo,
+  StopCause,
+} from '../queue/types.js';
+import { CommandRun } from './command-run.js';
+import type { RunHooks } from './command-run.js';
+import * as ops from './remote-ops.js';
+import type { Signal } from './remote-ops.js';
+import { isRunDir, isRunName } from './shell-protocol.js';
+import { ShellSession, dbg } from './shell-session.js';
+import type { CloseOptions } from './shell-session.js';
 
-const CMD_TIMEOUT = parseInt(process.env.CMD_TIMEOUT_MS ?? '30000');
-const DEBUG_SSH   = process.env.DEBUG_SSH === 'true';
+// Owns one ShellSession and at most one CommandRun per connection, and
+// implements the queue's CommandRunner on top of them.
+//
+// Events: 'connection:connected' | 'connection:disconnected' (id),
+//         'connection:error' (id, err)
+export class SshRegistry extends EventEmitter implements CommandRunner {
+  private sessions   = new Map<string, ShellSession>();
+  private connecting = new Map<string, Promise<ShellSession>>();
+  private runs       = new Map<string, CommandRun>();
+  // Run dirs whose results haven't been persisted yet — never reconciled away.
+  private unpersisted = new Set<string>();
 
-function makeSentinel(): string {
-  return `VIGIL_DONE_${Math.random().toString(36).slice(2)}`;
-}
-
-function dbg(connectionId: string, msg: string, data?: string): void {
-  if (!DEBUG_SSH) return;
-  console.log(`[ssh:debug][${connectionId}] ${msg}${data !== undefined ? ': ' + JSON.stringify(data) : ''}`);
-}
-
-interface ShellSession {
-  client:  Client;
-  stream:  ClientChannel;
-  buffer:  string;
-  busy:    boolean;
-  pending?: {
-    sentinel: string;
-    resolve:  (result: CommandResult) => void;
-    reject:   (err: Error) => void;
-    timer:    ReturnType<typeof setTimeout>;
+  private readonly runHooks: RunHooks = {
+    onSettled: (run, { result, error }) => {
+      if (this.runs.get(run.connectionId) === run) this.runs.delete(run.connectionId);
+      // Keep the dir until the queue saves the result — or reattaches, if detached.
+      const keep = result ? !result.lost : error instanceof RunDetachedError;
+      if (run.remote && keep) this.unpersisted.add(run.remote.dir);
+    },
+    onUnstoppable: (run) => {
+      console.warn(`[ssh] command did not exit after SIGKILL — resetting session ${run.connectionId}`);
+      run.session.close('stop escalation failed');
+    },
   };
-}
 
-export class SshRegistry extends EventEmitter {
-  private sessions = new Map<string, ShellSession>();
-
-  // ─── Connect ───────────────────────────────────────────────────────────────
+  // ─── Connect / disconnect ──────────────────────────────────────────────────
 
   async connect(connectionId: string): Promise<void> {
-    if (this.sessions.has(connectionId)) return;
+    await this.session(connectionId);
+  }
 
+  ensureConnected(connectionId: string): Promise<void> {
+    return this.connect(connectionId);
+  }
+
+  async disconnect(connectionId: string): Promise<void> {
+    this.sessions.get(connectionId)?.close('disconnected by request', { detach: false });
+  }
+
+  private session(connectionId: string): Promise<ShellSession> {
+    const open = this.sessions.get(connectionId);
+    if (open) return Promise.resolve(open);
+
+    let pending = this.connecting.get(connectionId);
+    if (!pending) {
+      pending = this.openSession(connectionId).finally(() => this.connecting.delete(connectionId));
+      this.connecting.set(connectionId, pending);
+    }
+    return pending;
+  }
+
+  private async openSession(connectionId: string): Promise<ShellSession> {
     const conn = getConnection(connectionId);
     if (!conn) throw new Error(`[ssh] connection not found: ${connectionId}`);
 
-    return new Promise((resolve, reject) => {
-      const client = new Client();
+    let session: ShellSession;
+    try {
+      session = await ShellSession.open(conn);
+    } catch (err) {
+      updateConnectionStatus(connectionId, 'ERROR', { error: (err as Error).message });
+      this.emit('connection:error', connectionId, err);
+      throw err;
+    }
 
-      client.once('ready', () => {
-        // false = no PTY allocation.
-        // Without a PTY there is no terminal driver to echo input back,
-        // which means our sentinel can only appear in the stream when we
-        // deliberately write it — never as part of a command echo.
-        client.shell(false, (err, stream) => {
-          if (err) {
-            client.end();
-            return reject(err);
-          }
+    session.on('data', (text: string) => {
+      const run = this.runs.get(connectionId);
+      if (run && run.session === session) run.handleShellData(text);
+      else dbg(connectionId, 'unexpected shell output', text);
+    });
 
-          const session: ShellSession = { client, stream, buffer: '', busy: false };
-          this.sessions.set(connectionId, session);
+    session.on('clientError', (err: Error) => {
+      updateConnectionStatus(connectionId, 'ERROR', { error: err.message });
+      this.emit('connection:error', connectionId, err);
+    });
 
-          stream.on('data', (chunk: Buffer) => {
-            const data = chunk.toString('utf8');
-            dbg(connectionId, 'raw', data);
-            this.handleData(connectionId, data);
-          });
+    session.on('close', (reason: string, opts: CloseOptions) => this.sessionClosed(session, reason, opts));
 
-          stream.on('close', () => this.handleClose(connectionId));
+    this.sessions.set(connectionId, session);
+    updateConnectionStatus(connectionId, 'CONNECTED', { last_connected_at: new Date().toISOString() });
+    console.log(`[ssh] connected: ${conn.name} @ ${conn.host}:${conn.port} (shell pid ${session.shellPid})`);
+    this.emit('connection:connected', connectionId);
+    return session;
+  }
 
-          // No stty needed (no PTY), just disable tracing and signal readiness.
-          stream.write('set +xv; echo VIGIL_READY\n');
+  // Only acts on state belonging to `session`, so a late close of an old
+  // session can't tear down its replacement.
+  private sessionClosed(session: ShellSession, reason: string, opts: CloseOptions): void {
+    const connectionId = session.connectionId;
 
-          updateConnectionStatus(connectionId, 'CONNECTED', {
-            last_connected_at: new Date().toISOString(),
-          });
+    if (this.sessions.get(connectionId) === session) {
+      this.sessions.delete(connectionId);
+      if (!opts.error) updateConnectionStatus(connectionId, 'DISCONNECTED');
+      console.log(`[ssh] session closed: ${connectionId} (${reason})`);
+      this.emit('connection:disconnected', connectionId);
+    }
 
-          console.log(`[ssh] connected: ${conn.name} @ ${conn.host}:${conn.port}`);
-          this.emit('connection:connected', connectionId);
+    const run = this.runs.get(connectionId);
+    if (run && run.session === session) run.sessionClosed(reason, opts);
+  }
 
-          const readyTimer = setTimeout(() => {
-            session.buffer = '';
-            resolve();
-          }, 1000);
+  // ─── Commands ──────────────────────────────────────────────────────────────
 
-          const readyCheck = setInterval(() => {
-            if (session.buffer.includes('VIGIL_READY')) {
-              clearTimeout(readyTimer);
-              clearInterval(readyCheck);
-              session.buffer = '';
-              resolve();
-            }
-          }, 50);
-        });
-      });
+  async exec(connectionId: string, command: string, opts: ExecOptions): Promise<ExecResult> {
+    const session = await this.session(connectionId);
+    this.assertIdle(connectionId);
+    if (!isRunName(opts.name)) throw new Error(`[ssh] invalid run name: ${opts.name}`);
 
-      client.once('error', (err) => {
-        updateConnectionStatus(connectionId, 'ERROR', { error: err.message });
-        this.emit('connection:error', connectionId, err);
-        reject(err);
-      });
+    const aborted = opts.isAborted?.();
+    if (aborted) return { output: '', stderr: '', exit_code: -1, stopped_by: aborted };
 
-      const cfg: ConnectConfig = {
-        host:     conn.host,
-        port:     conn.port,
-        username: conn.username,
-        ...(conn.auth_type === 'key' && conn.private_key
-          ? { privateKey: conn.private_key }
-          : {}),
-        ...(conn.auth_type === 'password' && conn.password
-          ? { password: conn.password }
-          : {}),
+    const run = CommandRun.start(session, command, opts, this.runHooks);
+    this.runs.set(connectionId, run);
+    return run.result;
+  }
+
+  // Reattach to a run that outlived its session (restart / dropped connection).
+  async recover(connectionId: string, remote: RemoteRun, opts: ExecOptions): Promise<ExecResult> {
+    const session = await this.session(connectionId);
+    this.assertIdle(connectionId);
+
+    const info = await ops.inspectRun(session, remote);
+
+    switch (info.state) {
+      case 'missing':
+        return { output: '', stderr: '', exit_code: -1, lost: true, run: remote,
+                 note: `run directory ${remote.dir} no longer exists on the host` };
+
+      case 'exited': {
+        this.unpersisted.add(remote.dir);
+        const output = await ops.readOutput(session, remote.dir);
+        return { output, stderr: '', exit_code: info.exit_code ?? -1, run: remote };
+      }
+
+      case 'dead': {
+        const output = await ops.readOutput(session, remote.dir);
+        return { output, stderr: '', exit_code: -1, lost: true, run: remote,
+                 note: 'the command was no longer running and did not record an exit code' };
+      }
+
+      case 'alive': {
+        const run = CommandRun.reattach(session, remote, info.size, opts, this.runHooks);
+        this.runs.set(connectionId, run);
+        console.log(`[ssh] reattached to running command in ${remote.dir} on ${connectionId}`);
+        return run.result;
+      }
+    }
+  }
+
+  async stop(connectionId: string, cause: StopCause): Promise<boolean> {
+    const run = this.runs.get(connectionId);
+    if (!run || run.isSettled) return false;
+    run.stop(cause);
+    return true;
+  }
+
+  async sendInput(connectionId: string, data: string, eof: boolean): Promise<void> {
+    const run = this.runs.get(connectionId);
+    if (!run) throw new Error('no running command to send input to');
+    await run.sendInput(data, eof);
+  }
+
+  private assertIdle(connectionId: string): void {
+    if (this.runs.has(connectionId)) throw new Error(`[ssh] session is busy: ${connectionId}`);
+  }
+
+  // ─── Run directories ───────────────────────────────────────────────────────
+
+  async cleanupRun(connectionId: string, dir: string): Promise<void> {
+    this.unpersisted.delete(dir);
+    const session = this.sessions.get(connectionId);
+    if (!session) return; // reconciled on next connect
+
+    if (!isRunDir(dir)) {
+      console.warn(`[ssh] refusing to clean up unexpected run dir: ${dir}`);
+      return;
+    }
+    await ops.removeRunDir(session, dir);
+  }
+
+  async readRunOutput(connectionId: string, dir: string): Promise<string> {
+    return ops.readOutput(await this.session(connectionId), dir);
+  }
+
+  // Run dirs on the host that no active or unpersisted run owns.
+  async listRuns(connectionId: string): Promise<RemoteRunInfo[]> {
+    const infos  = await ops.listRunDirs(await this.session(connectionId));
+    const active = new Set(this.activeRunDirs());
+    return infos.filter((r) => !active.has(r.dir) && !this.unpersisted.has(r.dir));
+  }
+
+  // Stop an orphaned run (no active token) and delete its directory.
+  async stopRun(connectionId: string, info: RemoteRunInfo): Promise<void> {
+    const session = await this.session(connectionId);
+
+    if (info.state === 'alive' && info.shell_pid) {
+      if (info.shell_pid === session.shellPid) {
+        throw new Error('run belongs to the active session shell; stop its token instead');
+      }
+      const remote: RemoteRun = {
+        dir: info.dir, shell_pid: info.shell_pid, holder_pid: info.holder_pid ?? 0, started_at: info.started_at ?? '',
       };
-
-      client.connect(cfg);
-    });
-  }
-
-  // ─── Disconnect ────────────────────────────────────────────────────────────
-
-  async disconnect(connectionId: string): Promise<void> {
-    const session = this.sessions.get(connectionId);
-    if (!session) return;
-
-    if (session.pending) {
-      clearTimeout(session.pending.timer);
-      session.pending.reject(new Error('[ssh] disconnected by request'));
-      delete session.pending;
+      for (const sig of ['INT', 'TERM', 'KILL'] as Signal[]) {
+        const extra = sig === 'KILL' ? [info.shell_pid, ...(info.holder_pid ? [info.holder_pid] : [])] : [];
+        await ops.signalTree(session, info.shell_pid, sig, { interruptRoot: sig === 'INT', extra });
+        await new Promise((r) => setTimeout(r, 1500));
+        if ((await ops.inspectRun(session, remote)).state !== 'alive') break;
+      }
     }
 
-    session.stream.end();
-    session.client.end();
-    this.sessions.delete(connectionId);
-    updateConnectionStatus(connectionId, 'DISCONNECTED');
-    console.log(`[ssh] disconnected: ${connectionId}`);
-  }
-
-  // ─── Execute ───────────────────────────────────────────────────────────────
-
-  async exec(connectionId: string, command: string): Promise<CommandResult> {
-    if (!this.sessions.has(connectionId)) {
-      await this.connect(connectionId);
-    }
-
-    const session = this.sessions.get(connectionId);
-    if (!session) throw new Error(`[ssh] no session for: ${connectionId}`);
-    if (session.busy) throw new Error(`[ssh] session is busy: ${connectionId}`);
-
-    session.busy    = true;
-    session.buffer  = '';
-    const sentinel  = makeSentinel();
-
-    dbg(connectionId, 'exec', command);
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (session.pending) {
-          delete session.pending;
-          session.busy = false;
-        }
-        reject(new Error(`[ssh] command timed out after ${CMD_TIMEOUT}ms: ${command}`));
-      }, CMD_TIMEOUT);
-
-      session.pending = { sentinel, resolve, reject, timer };
-
-      // Redirect stderr into stdout and write the sentinel on its own line
-      // once the command group exits. The sentinel is unique per invocation
-      // so it cannot appear in the output of the command itself.
-      const wrapped = `{ ${command}; } 2>&1; echo "${sentinel}:$?"\n`;
-      session.stream.write(wrapped);
-    });
+    await this.cleanupRun(connectionId, info.dir);
   }
 
   // ─── Status ────────────────────────────────────────────────────────────────
@@ -181,60 +242,7 @@ export class SshRegistry extends EventEmitter {
     return Array.from(this.sessions.keys());
   }
 
-  // ─── Internal ──────────────────────────────────────────────────────────────
-
-  private handleData(connectionId: string, data: string): void {
-    const session = this.sessions.get(connectionId);
-    if (!session?.pending) return;
-
-    session.buffer += data;
-
-    const { sentinel } = session.pending;
-    const sentinelIdx  = session.buffer.indexOf(sentinel);
-    if (sentinelIdx === -1) return;
-
-    const tail  = session.buffer.slice(sentinelIdx);
-    const match = tail.match(new RegExp(`${sentinel}:(\\d+)`));
-    if (!match) return;
-
-    const exitCode = parseInt(match[1], 10);
-
-    const raw    = session.buffer.slice(0, sentinelIdx);
-    const output = stripAnsi(raw)
-      .replace(/\r\n/g, '\n')
-      .replace(/\r/g, '\n')
-      .trim();
-
-    dbg(connectionId, 'output', output);
-    dbg(connectionId, 'exit_code', String(exitCode));
-
-    clearTimeout(session.pending.timer);
-    const { resolve } = session.pending;
-    delete session.pending;
-    session.busy   = false;
-    session.buffer = '';
-
-    resolve({ output, stderr: '', exit_code: exitCode });
+  activeRunDirs(): string[] {
+    return Array.from(this.runs.values()).flatMap((r) => (r.remote ? [r.remote.dir] : []));
   }
-
-  private handleClose(connectionId: string): void {
-    const session = this.sessions.get(connectionId);
-    if (!session) return;
-
-    if (session.pending) {
-      clearTimeout(session.pending.timer);
-      session.pending.reject(new Error('[ssh] connection closed unexpectedly'));
-      delete session.pending;
-    }
-
-    this.sessions.delete(connectionId);
-    updateConnectionStatus(connectionId, 'DISCONNECTED');
-    console.log(`[ssh] session closed: ${connectionId}`);
-    this.emit('connection:disconnected', connectionId);
-  }
-}
-
-function stripAnsi(str: string): string {
-  // eslint-disable-next-line no-control-regex
-  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
 }
