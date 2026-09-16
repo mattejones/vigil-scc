@@ -48,6 +48,49 @@ router.post('/tokens/:id/reject', (req, res) => {
   }
 });
 
+// Stop a running command (SIGINT → SIGTERM → SIGKILL).
+router.post('/tokens/:id/stop', async (req, res) => {
+  try {
+    await queue.stop(req.params.id, 'HUMAN');
+    res.json({ ok: true, token_id: req.params.id });
+  } catch (err) {
+    res.status(400).json({ error: String(err) });
+  }
+});
+
+// Operator input goes straight to the running command.
+router.post('/tokens/:id/input', async (req, res) => {
+  try {
+    const { data = '', newline = true, eof = false, secret = false } = (req.body ?? {}) as Record<string, any>;
+    const request = await queue.sendInput(req.params.id, {
+      data: String(data), newline: Boolean(newline), eof: Boolean(eof), secret: Boolean(secret),
+    }, 'HUMAN');
+    if (request.status !== 'SENT') return res.status(400).json({ error: request.error ?? request.status, request });
+    res.json({ ok: true, request });
+  } catch (err) {
+    res.status(400).json({ error: String(err) });
+  }
+});
+
+router.post('/tokens/:id/input/:requestId/approve', async (req, res) => {
+  try {
+    const request = await queue.approveInput(req.params.id, req.params.requestId);
+    if (request.status !== 'SENT') return res.status(400).json({ error: request.error ?? request.status, request });
+    res.json({ ok: true, request });
+  } catch (err) {
+    res.status(400).json({ error: String(err) });
+  }
+});
+
+router.post('/tokens/:id/input/:requestId/reject', (req, res) => {
+  try {
+    const request = queue.rejectInput(req.params.id, req.params.requestId);
+    res.json({ ok: true, request });
+  } catch (err) {
+    res.status(400).json({ error: String(err) });
+  }
+});
+
 // ─── Connections ──────────────────────────────────────────────────────────────
 
 function sanitize(conn: ReturnType<typeof getConnection>) {
@@ -62,11 +105,11 @@ router.get('/connections', (_req, res) => {
 
 router.post('/connections', (req, res) => {
   try {
-    const { name, host, port = 22, username, auth_type, private_key, password, auto_approve = false } = req.body as Record<string, any>;
+    const { name, host, port = 22, username, auth_type, private_key, password, auto_approve = false, auto_approve_input = false } = req.body as Record<string, any>;
     if (!name || !host || !username || !auth_type) {
       return res.status(400).json({ error: 'Missing required fields: name, host, username, auth_type' });
     }
-    const conn = createConnection({ name, host, port: Number(port), username, auth_type, private_key, password, auto_approve: Boolean(auto_approve) });
+    const conn = createConnection({ name, host, port: Number(port), username, auth_type, private_key, password, auto_approve: Boolean(auto_approve), auto_approve_input: Boolean(auto_approve_input) });
     queue.emit('connection:created', sanitize(conn));
     res.status(201).json(sanitize(conn));
   } catch (err) {
@@ -93,11 +136,14 @@ router.put('/connections/:id', async (req, res) => {
     const conn = getConnection(req.params.id);
     if (!conn) return res.status(404).json({ error: 'Connection not found' });
 
-    if (sshRegistry.isConnected(req.params.id)) {
+    const { name, host, port, username, auth_type, private_key, password, auto_approve, auto_approve_input } = req.body as Record<string, any>;
+
+    // Only credential/target changes need a fresh session — toggles don't.
+    const needsReconnect = [host, port, username, auth_type, private_key, password].some((v) => v !== undefined && v !== '');
+    if (needsReconnect && sshRegistry.isConnected(req.params.id)) {
       await sshRegistry.disconnect(req.params.id);
     }
 
-    const { name, host, port, username, auth_type, private_key, password, auto_approve } = req.body as Record<string, any>;
     const patch: Parameters<typeof updateConnection>[1] = {};
     if (name        !== undefined) patch.name        = name;
     if (host        !== undefined) patch.host        = host;
@@ -105,6 +151,7 @@ router.put('/connections/:id', async (req, res) => {
     if (username    !== undefined) patch.username    = username;
     if (auth_type   !== undefined) patch.auth_type   = auth_type;
     if (auto_approve !== undefined) patch.auto_approve = Boolean(auto_approve);
+    if (auto_approve_input !== undefined) patch.auto_approve_input = Boolean(auto_approve_input);
     if (private_key)               patch.private_key  = private_key;
     if (password)                  patch.password     = password;
 
@@ -138,6 +185,25 @@ router.post('/connections/:id/connect', async (req, res) => {
     const conn = getConnection(req.params.id);
     if (!conn) return res.status(404).json({ error: 'Connection not found' });
     await sshRegistry.connect(req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: String(err).replace(/^Error:\s*/, '') });
+  }
+});
+
+// Runs left on the host that no token is tracking (e.g. after a lost session).
+router.get('/connections/:id/orphans', async (req, res) => {
+  try {
+    if (!getConnection(req.params.id)) return res.status(404).json({ error: 'Connection not found' });
+    res.json(await queue.listOrphans(req.params.id));
+  } catch (err) {
+    res.status(400).json({ error: String(err).replace(/^Error:\s*/, '') });
+  }
+});
+
+router.post('/connections/:id/orphans/:name/stop', async (req, res) => {
+  try {
+    await queue.stopOrphan(req.params.id, req.params.name);
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: String(err).replace(/^Error:\s*/, '') });

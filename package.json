@@ -4,6 +4,8 @@
   "description": "Human-on-the-loop SSH Command Center with MCP interface",
   "main": "dist/index.js",
   "scripts": {
+    "up": "bash scripts/vigil.sh dev",
+    "up:prod": "bash scripts/vigil.sh prod",
     "dev": "nodemon",
     "build": "tsc",
     "start": "node dist/index.js",

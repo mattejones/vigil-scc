@@ -22,8 +22,8 @@ const MCP_PORT = parseInt(process.env.MCP_PORT ?? '3001');
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 initDb();
-queue.init();
 initSsh();
+queue.init();   // after initSsh: reattaches to runs that were in flight at shutdown
 
 // ─── Web UI server (port 3000) ────────────────────────────────────────────────
 
@@ -37,18 +37,20 @@ export const io = new SocketIOServer(httpServer, {
 app.use(cors());
 app.use(express.json());
 
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(__dirname, '../client/dist')));
-  app.get('*', (_req, res) => {
-    res.sendFile(path.join(__dirname, '../client/dist/index.html'));
-  });
-}
-
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'vigil-scc', version: '0.1.0' });
 });
 
 app.use('/api', apiRouter);
+
+// Serve the built UI after the API routes so they take precedence.
+// Express 5 needs a named wildcard (`/{*splat}`), not `*`.
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, '../client/dist')));
+  app.get('/{*splat}', (_req, res) => {
+    res.sendFile(path.join(__dirname, '../client/dist/index.html'));
+  });
+}
 
 io.on('connection', (socket) => {
   console.log(`[ws] client connected: ${socket.id}`);
@@ -64,10 +66,15 @@ const bridgedEvents = [
   'token:approved',
   'token:rejected',
   'token:started',
+  'token:command:output',
   'token:command:complete',
   'token:completed',
   'token:failed',
   'token:waiting',
+  'token:running',
+  'token:input:requested',
+  'token:input:resolved',
+  'token:recovered',
   'connection:connected',
   'connection:disconnected',
   'connection:error',

@@ -61,6 +61,23 @@ xterm.js is installed. A terminal pane per connection shows the live shell sessi
 
 ---
 
+## Functional — Long-running Commands ✅
+
+- [x] Fix: timeout released the session while the command kept running (30s wedge)
+- [x] Fix: unhandled ssh2 `'error'` events crashing the server; zombie sessions on close
+- [x] Fix: leaked handshake interval, exit-code chunk-split race, `inject()` lock release
+- [x] SSH keepalive + connect de-duplication
+- [x] No default timeout; optional `CMD_TIMEOUT_MS` fallback and per-command `timeout_seconds`
+- [x] Stop button (UI) and `vigil_cancel` on running tokens — SIGINT → SIGTERM → SIGKILL
+- [x] Live output streaming (`token:command:output`) and `vigil_wait` long-poll
+- [x] Stdin via per-run FIFO; WAITING_FOR_INPUT detection; operator input + AI input approvals
+- [x] `auto_approve_input` per connection
+- [x] Tracked runs on the host; reattach after restart / dropped connection; orphaned run cleanup
+- [ ] Browser notification when a token starts waiting for input
+- [ ] Surface long-idle RUNNING commands (no output for N minutes) in the UI
+
+---
+
 ## Functional — File Transfer 🟡
 
 Send scripts and files to remote servers over SFTP (built into ssh2).

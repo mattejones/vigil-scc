@@ -1,7 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { queue } from '../queue/queue.js';
+import { queue, TERMINAL_STATUSES } from '../queue/queue.js';
 import { listConnections, getToken, listTokens, createConnection } from '../queue/store.js';
+import type { Token } from '../queue/types.js';
 
 // Factory — each transport connection gets its own McpServer instance.
 // The SDK does not allow a single McpServer to connect to more than one transport.
@@ -40,20 +41,39 @@ WORKFLOW
 2. Call vigil_enqueue to submit one or more commands for approval.
    - You MUST provide a clear, specific description — the human reads this to decide whether to approve.
    - Commands run sequentially. A non-zero exit on a fatal command halts the batch.
-3. Poll vigil_poll with the returned token_id until you get a terminal status.
-   - Poll every few seconds. Do not assume immediate execution.
+3. Call vigil_wait (preferred) or vigil_poll with the returned token_id until is_terminal is true.
+   - vigil_wait blocks up to ~50s and returns as soon as something changes.
+   - Commands may run for a long time; there is no timeout by default. Partial output
+     appears in commands[i].output while the token is RUNNING.
 4. On COMPLETED: read the output from each command's output field.
 5. On FAILED or REJECTED: read the error field. Replan accordingly — do not blindly retry.
+
+LONG-RUNNING COMMANDS
+---------------------
+- Set commands[i].timeout_seconds if a command should be stopped after a known time.
+- To stop a running command yourself, call vigil_cancel (SIGINT, then SIGTERM, then SIGKILL).
+- The operator can also Stop a command at any time. error.reason is then STOPPED (or TIMEOUT).
+
+INTERACTIVE PROMPTS
+-------------------
+Prefer non-interactive flags (apt-get -y, --yes, --non-interactive, heredocs). If a command
+does block on input, the token becomes WAITING_FOR_INPUT and vigil_poll / vigil_wait return
+waiting_for_input.prompt and recent_output, plus input_mode:
+- input_mode "direct": call vigil_send_input with the answer; it is delivered immediately.
+- input_mode "requires_approval": tell the operator in chat what the prompt says and what you
+  propose to send, then call vigil_send_input. The request appears in Vigil for one-click
+  approval; follow it in input_requests (PENDING → SENT / REJECTED / EXPIRED).
+Never send passwords or secrets as input — ask the operator to type those in Vigil.
 
 TOKEN STATUSES
 --------------
 PENDING_APPROVAL  Waiting for the human operator to approve or reject.
 APPROVED          Approved, queued for execution (another batch may be ahead of it).
 RUNNING           Currently executing on the server.
+WAITING_FOR_INPUT The running command is blocked waiting for stdin (see INTERACTIVE PROMPTS).
 COMPLETED         All commands finished successfully.
-FAILED            A command exited non-zero (fatal=true), or a connection error occurred.
+FAILED            A command exited non-zero (fatal=true), was stopped, or a connection error occurred.
 REJECTED          The human operator rejected the batch.
-WAITING_FOR_INPUT The session is blocked waiting for stdin (operator will respond).
 
 IMPORTANT BEHAVIOURS
 --------------------
@@ -62,6 +82,9 @@ IMPORTANT BEHAVIOURS
   Reconcile your understanding of server state with these mutations before proceeding.
 - If a batch is rejected, check error.human_note for the operator's reason.
 - Connections are persistent SSH sessions. You do not need to re-authenticate between batches.
+- Commands are tracked on the host. If Vigil restarts or the connection drops mid-command, it
+  reattaches (recovered: true). Shell state (cwd, env) from earlier commands is lost in that case,
+  so the rest of the batch is not run (error.reason SESSION_LOST) — replan from the output.
 - Per connection, only one batch runs at a time. Multiple connections run in parallel.
 `.trim(),
     }],
@@ -76,12 +99,14 @@ mcpServer.tool(
   {},
   async () => {
     const connections = listConnections().map((c) => ({
-      id:       c.id,
-      name:     c.name,
-      host:     c.host,
-      port:     c.port,
-      username: c.username,
-      status:   c.status,
+      id:                 c.id,
+      name:               c.name,
+      host:               c.host,
+      port:               c.port,
+      username:           c.username,
+      status:             c.status,
+      auto_approve:       c.auto_approve,
+      auto_approve_input: c.auto_approve_input,
     }));
 
     return {
@@ -170,13 +195,17 @@ IMPORTANT:
 - Commands run sequentially in the order given.
 - fatal (default: true) — if a command exits non-zero, the batch halts.
   Set fatal: false for commands where failure is expected or acceptable (e.g. mkdir -p).
-- After calling this, use vigil_poll with the returned token_id to check progress.`,
+- Long-running commands are fine: there is no timeout unless you set timeout_seconds.
+- Prefer non-interactive flags; if a command prompts for input, see vigil_send_input.
+- After calling this, use vigil_wait (or vigil_poll) with the returned token_id to follow progress.`,
   {
     connection_id: z.string().describe('ID of the target SSH connection from vigil_list_connections'),
     description:   z.string().min(10).describe('Clear human-readable explanation of what this batch does and why'),
     commands: z.array(z.object({
       command: z.string().min(1).describe('The shell command to run'),
       fatal:   z.boolean().optional().describe('Halt batch on non-zero exit. Defaults to true.'),
+      timeout_seconds: z.number().int().min(1).optional()
+        .describe('Stop the command (SIGINT → SIGTERM → SIGKILL) if it runs longer than this. Default: no timeout.'),
     })).min(1).describe('Ordered list of commands to execute'),
   },
   async ({ connection_id, description, commands }) => {
@@ -190,7 +219,7 @@ IMPORTANT:
             status:        token.status,
             command_count: token.commands.length,
             message: `${commands.length} command(s) queued for human approval. ` +
-                     `Poll vigil_poll with token_id "${token.id}" every few seconds until you see a terminal status.`,
+                     `Call vigil_wait with token_id "${token.id}" until is_terminal is true.`,
           }, null, 2),
         }],
       };
@@ -208,7 +237,9 @@ IMPORTANT:
 mcpServer.tool(
   'vigil_poll',
   `Check the status and output of a previously enqueued token.
-Call this repeatedly (every few seconds) until status is one of: COMPLETED, FAILED, REJECTED.
+Call this until is_terminal is true (or use vigil_wait, which blocks until something changes).
+While RUNNING, commands[i].output holds partial output.
+If status is WAITING_FOR_INPUT, read waiting_for_input and input_mode, then see vigil_send_input.
 On COMPLETED: read output from each command in the commands array.
 On FAILED or REJECTED: read the error field and replan — do not blindly retry.
 Check session_mutations for any commands the human injected directly into the session.`,
@@ -217,36 +248,73 @@ Check session_mutations for any commands the human injected directly into the se
   },
   async ({ token_id }) => {
     const token = getToken(token_id);
-    if (!token) {
+    if (!token) return tokenNotFound(token_id);
+    return tokenResponse(token);
+  }
+);
+
+// ─── Tool: wait ───────────────────────────────────────────────────────────────
+
+mcpServer.tool(
+  'vigil_wait',
+  `Like vigil_poll, but blocks until the token changes state (approved, started, completed, failed,
+starts or stops waiting for input, an input request resolves) or timeout_seconds elapses, then
+returns the same payload as vigil_poll. Use this instead of polling in a tight loop.`,
+  {
+    token_id:        z.string().describe('Token ID returned by vigil_enqueue'),
+    timeout_seconds: z.number().int().min(1).max(50).optional().describe('Maximum time to block (default 30, max 50)'),
+  },
+  async ({ token_id, timeout_seconds }) => {
+    const token = getToken(token_id);
+    if (!token) return tokenNotFound(token_id);
+
+    // Return immediately when the caller has something to act on.
+    const actionable = TERMINAL_STATUSES.includes(token.status) ||
+      (token.status === 'WAITING_FOR_INPUT' && !token.input_requests.some((r) => r.status === 'PENDING'));
+    if (!actionable) {
+      await queue.waitForChange(token_id, (timeout_seconds ?? 30) * 1000);
+    }
+    return tokenResponse(getToken(token_id)!);
+  }
+);
+
+// ─── Tool: send input ─────────────────────────────────────────────────────────
+
+mcpServer.tool(
+  'vigil_send_input',
+  `Send stdin to a running command, typically one whose token is WAITING_FOR_INPUT (e.g. to answer
+a "Continue? [Y/n]" prompt).
+- If input_mode is "direct", it is delivered immediately (status SENT).
+- Otherwise it needs operator approval (status PENDING). Tell the operator in chat what the prompt
+  says and what you are sending, then use vigil_wait to see it resolve (SENT / REJECTED / EXPIRED).
+Never send passwords or other secrets — ask the operator to enter those in Vigil.`,
+  {
+    token_id: z.string().describe('Token ID of the running command'),
+    data:     z.string().describe('Text to send (may be empty when only sending EOF)'),
+    newline:  z.boolean().optional().describe('Append a newline (press Enter). Defaults to true.'),
+    eof:      z.boolean().optional().describe('Close stdin after sending (like Ctrl+D). Defaults to false.'),
+  },
+  async ({ token_id, data, newline, eof }) => {
+    try {
+      const request = await queue.sendInput(token_id, { data, newline, eof }, 'AI');
+      const message =
+        request.status === 'PENDING' ? 'Input is awaiting operator approval in Vigil. Let the operator know, then call vigil_wait.' :
+        request.status === 'SENT'    ? 'Input delivered to the command.' :
+        `Input was not delivered: ${request.error ?? request.status}`;
+
+      return {
+        ...(request.status === 'FAILED' || request.status === 'EXPIRED' ? { isError: true } : {}),
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ request_id: request.id, status: request.status, error: request.error, message }, null, 2),
+        }],
+      };
+    } catch (err) {
       return {
         isError: true,
-        content: [{ type: 'text' as const, text: JSON.stringify({ error: `Token not found: ${token_id}` }) }],
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: String(err) }) }],
       };
     }
-
-    const terminalStatuses = ['COMPLETED', 'FAILED', 'REJECTED'];
-    const isTerminal = terminalStatuses.includes(token.status);
-
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          token_id:          token.id,
-          status:            token.status,
-          is_terminal:       isTerminal,
-          description:       token.description,
-          connection_id:     token.connection_id,
-          commands:          token.commands,
-          error:             token.error ?? null,
-          session_mutations: token.session_mutations,
-          created_at:        token.created_at,
-          updated_at:        token.updated_at,
-          approved_at:       token.approved_at ?? null,
-          completed_at:      token.completed_at ?? null,
-          ...(isTerminal ? {} : { hint: 'Status is not yet terminal. Poll again in a few seconds.' }),
-        }, null, 2),
-      }],
-    };
   }
 );
 
@@ -254,10 +322,10 @@ Check session_mutations for any commands the human injected directly into the se
 
 mcpServer.tool(
   'vigil_queue_status',
-  'View all active tokens in the queue (PENDING_APPROVAL, APPROVED, RUNNING). Useful for understanding what is currently waiting or in progress.',
+  'View all active tokens in the queue (PENDING_APPROVAL, APPROVED, RUNNING, WAITING_FOR_INPUT). Useful for understanding what is currently waiting or in progress.',
   {},
   async () => {
-    const active = listTokens(['PENDING_APPROVAL', 'APPROVED', 'RUNNING']);
+    const active = listTokens(['PENDING_APPROVAL', 'APPROVED', 'RUNNING', 'WAITING_FOR_INPUT']);
     return {
       content: [{
         type: 'text' as const,
@@ -281,16 +349,29 @@ mcpServer.tool(
 
 mcpServer.tool(
   'vigil_cancel',
-  'Cancel a token that is still PENDING_APPROVAL. Use this if you submitted incorrect commands and want to withdraw them before the human reviews.',
+  `Cancel a token at any non-terminal stage.
+- PENDING_APPROVAL / APPROVED: withdrawn before it runs.
+- RUNNING / WAITING_FOR_INPUT: the running command is stopped (SIGINT, then SIGTERM, then SIGKILL)
+  and the rest of the batch is skipped. The token becomes FAILED with error.reason STOPPED — use
+  vigil_wait to see the final output.`,
   {
     token_id: z.string().describe('Token ID to cancel'),
     reason:   z.string().optional().describe('Optional reason for cancellation'),
   },
   async ({ token_id, reason }) => {
     try {
-      queue.reject(token_id, reason ? `[AI cancelled] ${reason}` : '[AI cancelled]');
+      const before  = getToken(token_id);
+      const running = before?.status === 'RUNNING' || before?.status === 'WAITING_FOR_INPUT';
+      await queue.cancel(token_id, 'AI', reason ? `[AI cancelled] ${reason}` : '[AI cancelled]');
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ success: true, token_id, message: 'Token cancelled.' }) }],
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            token_id,
+            message: running ? 'Stop requested. Call vigil_wait to see the final status and output.' : 'Token cancelled.',
+          }),
+        }],
       };
     } catch (err) {
       return {
@@ -302,3 +383,57 @@ mcpServer.tool(
 );
 
 } // end registerAll
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function tokenNotFound(tokenId: string) {
+  return {
+    isError: true,
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: `Token not found: ${tokenId}` }) }],
+  };
+}
+
+function tokenResponse(token: Token) {
+  const isTerminal = TERMINAL_STATUSES.includes(token.status);
+  const running    = token.commands.find((c) => c.executed_at && !c.completed_at);
+  const inputMode  = queue.inputAutoApproved(token.connection_id) ? 'direct' : 'requires_approval';
+  const pending    = token.input_requests.some((r) => r.status === 'PENDING');
+
+  let hint: string | undefined;
+  if (token.status === 'WAITING_FOR_INPUT') {
+    hint = pending
+      ? 'Your input is awaiting operator approval in Vigil. Remind the operator if needed, then call vigil_wait.'
+      : inputMode === 'direct'
+        ? 'The command is waiting for input. Answer with vigil_send_input, or vigil_cancel to stop it.'
+        : 'The command is waiting for input, and input needs operator approval. Tell the operator what the ' +
+          'prompt says and what you propose to send, then call vigil_send_input (or vigil_cancel to stop it).';
+  } else if (!isTerminal) {
+    hint = 'Status is not yet terminal. Call vigil_wait to block until it changes.';
+  }
+
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({
+        token_id:              token.id,
+        status:                token.status,
+        is_terminal:           isTerminal,
+        description:           token.description,
+        connection_id:         token.connection_id,
+        running_command_index: running && !isTerminal ? running.index : null,
+        recovered:             token.recovered ?? false,
+        waiting_for_input:     token.waiting_for_input ?? null,
+        input_mode:            inputMode,
+        input_requests:        token.input_requests,
+        commands:              token.commands.map(({ remote_run: _run, ...c }) => c),
+        error:                 token.error ?? null,
+        session_mutations:     token.session_mutations,
+        created_at:            token.created_at,
+        updated_at:            token.updated_at,
+        approved_at:           token.approved_at ?? null,
+        completed_at:          token.completed_at ?? null,
+        ...(hint ? { hint } : {}),
+      }, null, 2),
+    }],
+  };
+}

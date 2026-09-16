@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import type { Connection } from '../types'
+import type { Connection, RemoteRunInfo } from '../types'
 
 interface Props {
   connections:          Connection[]
@@ -10,6 +10,8 @@ interface Props {
   onConnect:            (id: string) => void
   onDisconnect:         (id: string) => void
   onToggleAutoApprove:  (conn: Connection) => void
+  onListOrphans:        (id: string) => Promise<RemoteRunInfo[] | string>
+  onStopOrphan:         (id: string, name: string) => Promise<string | null>
 }
 
 function relativeTime(iso?: string): string {
@@ -21,16 +23,69 @@ function relativeTime(iso?: string): string {
   return `${Math.floor(diff / 86400)}d ago`
 }
 
-function ConnRow({ conn, onEdit, onDelete, onConnect, onDisconnect, onToggleAutoApprove }: {
+// Runs left on the host that no token tracks (e.g. after a lost session).
+function OrphanRuns({ conn, onList, onStop }: {
+  conn:   Connection
+  onList: () => Promise<RemoteRunInfo[] | string>
+  onStop: (name: string) => Promise<string | null>
+}) {
+  const [runs,     setRuns]     = useState<RemoteRunInfo[] | null>(null)
+  const [error,    setError]    = useState<string | null>(null)
+  const [stopping, setStopping] = useState<string | null>(null)
+
+  const apply = (result: RemoteRunInfo[] | string) => {
+    if (typeof result === 'string') { setError(result); setRuns([]) }
+    else { setError(null); setRuns(result) }
+  }
+
+  const load = async () => apply(await onList())
+
+  useEffect(() => {
+    let cancelled = false
+    onList().then(result => { if (!cancelled) apply(result) })
+    return () => { cancelled = true }
+  }, [conn.id])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  const stop = async (name: string) => {
+    setStopping(name)
+    const err = await onStop(name)
+    setStopping(null)
+    if (err) setError(err)
+    await load()
+  }
+
+  if (runs === null) return <div className="orphan-list"><div className="orphan-empty">Checking host…</div></div>
+
+  return (
+    <div className="orphan-list">
+      {error && <div className="conn-error">{error}</div>}
+      {runs.length === 0 && !error && <div className="orphan-empty">No untracked runs on this host</div>}
+      {runs.map(run => (
+        <div key={run.dir} className="orphan-row" title={run.dir}>
+          <span className={`orphan-state ${run.state}`}>{run.state}{run.state === 'exited' ? ` ${run.exit_code}` : ''}</span>
+          <span className="orphan-name">{run.name}</span>
+          <button className="conn-btn-sm conn-btn-disconnect" disabled={stopping === run.name} onClick={() => stop(run.name)}>
+            {stopping === run.name ? '…' : run.state === 'alive' ? 'Stop & clean' : 'Clean'}
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function ConnRow({ conn, onEdit, onDelete, onConnect, onDisconnect, onToggleAutoApprove, onListOrphans, onStopOrphan }: {
   conn:                Connection
   onEdit:              () => void
   onDelete:            () => void
   onConnect:           () => void
   onDisconnect:        () => void
   onToggleAutoApprove: () => void
+  onListOrphans:       () => Promise<RemoteRunInfo[] | string>
+  onStopOrphan:        (name: string) => Promise<string | null>
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [connecting,    setConnecting]    = useState(false)
+  const [showRuns,      setShowRuns]      = useState(false)
 
   // Clear connecting spinner when status resolves
   useEffect(() => { setConnecting(false) }, [conn.status])
@@ -72,9 +127,15 @@ function ConnRow({ conn, onEdit, onDelete, onConnect, onDisconnect, onToggleAuto
       {/* Controls row: connect/disconnect + auto-approve */}
       <div className="conn-controls">
         {conn.status === 'CONNECTED' ? (
-          <button className="conn-btn-sm conn-btn-disconnect" onClick={onDisconnect}>
-            ● Disconnect
-          </button>
+          <>
+            <button className="conn-btn-sm conn-btn-disconnect" onClick={onDisconnect}>
+              ● Disconnect
+            </button>
+            <button className={`conn-btn-sm conn-btn-disconnect ${showRuns ? 'active' : ''}`}
+              onClick={() => setShowRuns(v => !v)} title="Runs left on the host that no task is tracking">
+              Runs
+            </button>
+          </>
         ) : (
           <button
             className={`conn-btn-sm conn-btn-connect ${conn.status === 'ERROR' ? 'error' : ''}`}
@@ -93,6 +154,10 @@ function ConnRow({ conn, onEdit, onDelete, onConnect, onDisconnect, onToggleAuto
           ⚡ AUTO
         </button>
       </div>
+
+      {showRuns && conn.status === 'CONNECTED' && (
+        <OrphanRuns conn={conn} onList={onListOrphans} onStop={onStopOrphan} />
+      )}
 
       {/* Connection error message */}
       {conn.status === 'ERROR' && conn.error && (
@@ -115,6 +180,8 @@ export function Sidebar({
   onConnect,
   onDisconnect,
   onToggleAutoApprove,
+  onListOrphans,
+  onStopOrphan,
 }: Props) {
   return (
     <aside className="sidebar">
@@ -139,6 +206,8 @@ export function Sidebar({
               onConnect={() => onConnect(conn.id)}
               onDisconnect={() => onDisconnect(conn.id)}
               onToggleAutoApprove={() => onToggleAutoApprove(conn)}
+              onListOrphans={() => onListOrphans(conn.id)}
+              onStopOrphan={(name) => onStopOrphan(conn.id, name)}
             />
           ))
         )}

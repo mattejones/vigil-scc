@@ -8,6 +8,8 @@ import type {
   TokenError,
   Command,
   SessionMutation,
+  InputRequest,
+  WaitingForInput,
   Connection,
   SessionEvent,
   TokenSource,
@@ -76,9 +78,16 @@ export function initDb(): void {
   `);
 
   // Migrations — safe to run on every startup.
-  try {
-    db.exec(`ALTER TABLE connections ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0`);
-  } catch { /* column already exists */ }
+  const migrations = [
+    `ALTER TABLE connections ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE connections ADD COLUMN auto_approve_input INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE tokens ADD COLUMN waiting_for_input TEXT`,
+    `ALTER TABLE tokens ADD COLUMN input_requests TEXT NOT NULL DEFAULT '[]'`,
+    `ALTER TABLE tokens ADD COLUMN recovered INTEGER NOT NULL DEFAULT 0`,
+  ];
+  for (const sql of migrations) {
+    try { db.exec(sql); } catch { /* column already exists */ }
+  }
 
   console.log(`[db] initialised → ${dbPath}`);
 }
@@ -104,6 +113,9 @@ function rowToToken(row: Record<string, unknown>): Token {
     commands:         JSON.parse(row.commands as string),
     error:            row.error ? JSON.parse(row.error as string) : undefined,
     session_mutations: JSON.parse(row.session_mutations as string),
+    waiting_for_input: row.waiting_for_input ? JSON.parse(row.waiting_for_input as string) : undefined,
+    input_requests:   row.input_requests ? JSON.parse(row.input_requests as string) : [],
+    recovered:        Boolean(row.recovered),
     created_at:       row.created_at as string,
     updated_at:       row.updated_at as string,
     approved_at:      row.approved_at as string | undefined,
@@ -124,6 +136,7 @@ export function createToken(
     source:           params.source,
     commands:         params.commands,
     session_mutations: [],
+    input_requests:   [],
     created_at:       now(),
     updated_at:       now(),
   };
@@ -183,7 +196,7 @@ export function updateTokenError(id: string, error: TokenError): void {
 export function updateCommand(
   tokenId: string,
   commandIndex: number,
-  patch: Partial<Pick<Command, 'output' | 'stderr' | 'exit_code' | 'executed_at' | 'completed_at'>>
+  patch: Partial<Pick<Command, 'output' | 'stderr' | 'exit_code' | 'executed_at' | 'completed_at' | 'remote_run'>>
 ): void {
   const token = getToken(tokenId);
   if (!token) throw new Error(`[db] token ${tokenId} not found`);
@@ -207,15 +220,33 @@ export function addSessionMutation(tokenId: string, mutation: SessionMutation): 
   `).run({ id: tokenId, mutations: JSON.stringify(mutations), updated_at: now() });
 }
 
-// Mark any tokens that were RUNNING or APPROVED at shutdown as failed.
-// Called on startup to prevent phantom in-progress tokens.
+export function setWaitingForInput(id: string, waiting: WaitingForInput | null): void {
+  getDb().prepare(`
+    UPDATE tokens SET waiting_for_input = @waiting, updated_at = @updated_at WHERE id = @id
+  `).run({ id, waiting: waiting ? JSON.stringify(waiting) : null, updated_at: now() });
+}
+
+export function setInputRequests(id: string, requests: InputRequest[]): void {
+  getDb().prepare(`
+    UPDATE tokens SET input_requests = @requests, updated_at = @updated_at WHERE id = @id
+  `).run({ id, requests: JSON.stringify(requests), updated_at: now() });
+}
+
+export function setTokenRecovered(id: string, recovered: boolean): void {
+  getDb().prepare(`
+    UPDATE tokens SET recovered = @recovered, updated_at = @updated_at WHERE id = @id
+  `).run({ id, recovered: recovered ? 1 : 0, updated_at: now() });
+}
+
+// Mark tokens that were APPROVED (queued, never started) at shutdown as failed.
+// RUNNING / WAITING_FOR_INPUT tokens are handled by run recovery in QueueManager.
 export function reconcileStaleTokens(): number {
   const result = getDb().prepare(`
     UPDATE tokens
     SET status = 'FAILED',
         error  = '{"reason":"SERVER_RESTART"}',
         updated_at = ?
-    WHERE status IN ('RUNNING', 'APPROVED')
+    WHERE status = 'APPROVED'
   `).run(now());
 
   return result.changes;
@@ -234,6 +265,7 @@ function rowToConnection(row: Record<string, unknown>): Connection {
     private_key:       row.private_key as string | undefined,
     password:          row.password as string | undefined,
     auto_approve:      Boolean(row.auto_approve),
+    auto_approve_input: Boolean(row.auto_approve_input),
     status:            row.status as Connection['status'],
     error:             row.error as string | undefined,
     created_at:        row.created_at as string,
@@ -242,23 +274,31 @@ function rowToConnection(row: Record<string, unknown>): Connection {
 }
 
 export function createConnection(
-  params: Omit<Connection, 'id' | 'status' | 'created_at' | 'auto_approve'> & { auto_approve?: boolean }
+  params: Omit<Connection, 'id' | 'status' | 'created_at' | 'auto_approve' | 'auto_approve_input'>
+    & { auto_approve?: boolean; auto_approve_input?: boolean }
 ): Connection {
   const conn: Connection = {
-    id:           uuidv4(),
-    status:       'DISCONNECTED',
-    created_at:   now(),
-    auto_approve: false,
+    id:                 uuidv4(),
+    status:             'DISCONNECTED',
+    created_at:         now(),
+    auto_approve:       false,
+    auto_approve_input: false,
     ...params,
   };
 
-  const { auto_approve, ...rest } = conn;
+  const { auto_approve, auto_approve_input, ...rest } = conn;
   getDb().prepare(`
     INSERT INTO connections
-      (id, name, host, port, username, auth_type, private_key, password, auto_approve, status, created_at)
+      (id, name, host, port, username, auth_type, private_key, password, auto_approve, auto_approve_input, status, created_at)
     VALUES
-      (@id, @name, @host, @port, @username, @auth_type, @private_key, @password, @auto_approve, @status, @created_at)
-  `).run({ ...rest, auto_approve: auto_approve ? 1 : 0 });
+      (@id, @name, @host, @port, @username, @auth_type, @private_key, @password, @auto_approve, @auto_approve_input, @status, @created_at)
+  `).run({
+    private_key: null,
+    password:    null,
+    ...rest,
+    auto_approve:       auto_approve ? 1 : 0,
+    auto_approve_input: auto_approve_input ? 1 : 0,
+  });
 
   return conn;
 }
@@ -277,7 +317,7 @@ export function listConnections(): Connection[] {
 
 export function updateConnection(
   id: string,
-  patch: Partial<Pick<Connection, 'name' | 'host' | 'port' | 'username' | 'auth_type' | 'private_key' | 'password' | 'auto_approve'>>
+  patch: Partial<Pick<Connection, 'name' | 'host' | 'port' | 'username' | 'auth_type' | 'private_key' | 'password' | 'auto_approve' | 'auto_approve_input'>>
 ): Connection {
   const conn = getConnection(id);
   if (!conn) throw new Error(`[db] connection ${id} not found`);
@@ -287,7 +327,8 @@ export function updateConnection(
   getDb().prepare(`
     UPDATE connections
     SET name=@name, host=@host, port=@port, username=@username,
-        auth_type=@auth_type, private_key=@private_key, password=@password, auto_approve=@auto_approve
+        auth_type=@auth_type, private_key=@private_key, password=@password, auto_approve=@auto_approve,
+        auto_approve_input=@auto_approve_input
     WHERE id=@id
   `).run({
     id,
@@ -299,6 +340,7 @@ export function updateConnection(
     private_key:  merged.private_key ?? null,
     password:     merged.password ?? null,
     auto_approve: merged.auto_approve ? 1 : 0,
+    auto_approve_input: merged.auto_approve_input ? 1 : 0,
   });
 
   return getConnection(id)!;
@@ -327,10 +369,17 @@ export function updateConnectionStatus(
 export function logSessionEvent(event: Omit<SessionEvent, 'id' | 'created_at'>): SessionEvent {
   const full: SessionEvent = { id: uuidv4(), created_at: now(), ...event };
 
+  // better-sqlite3 requires every named parameter to be bound.
   getDb().prepare(`
     INSERT INTO session_events (id, connection_id, token_id, command, output, stderr, exit_code, source, created_at)
     VALUES (@id, @connection_id, @token_id, @command, @output, @stderr, @exit_code, @source, @created_at)
-  `).run(full);
+  `).run({
+    ...full,
+    token_id:  full.token_id  ?? null,
+    output:    full.output    ?? null,
+    stderr:    full.stderr    ?? null,
+    exit_code: full.exit_code ?? null,
+  });
 
   return full;
 }
