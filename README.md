@@ -32,13 +32,20 @@ PENDING_APPROVAL → APPROVED → RUNNING → COMPLETED
 
 ## Getting Started
 
+**One click (Windows + WSL):** double-click `Vigil.cmd`. It starts everything inside WSL and opens the UI.
+
+**One command (WSL / Linux):**
+
 ```bash
-cp .env.example .env
-npm install
-npm run dev
+npm run up          # dev: API + MCP with auto-reload, UI on http://localhost:5173
+npm run up:prod     # build, then serve UI + API from http://localhost:3000
 ```
 
-Web UI: http://localhost:3000
+The launcher (`scripts/vigil.sh`) picks up Node 20+ from nvm if needed, installs
+dependencies when they're missing or stale, creates `.env` from `.env.example`,
+checks the ports are free, and stops everything on Ctrl+C. Pass `--open` to open
+the browser, or run `scripts/vigil.sh --help` for options.
+
 MCP endpoint: http://localhost:3001/mcp
 
 ## MCP Configuration (Claude Desktop)

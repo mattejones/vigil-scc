@@ -142,16 +142,21 @@ vigil-scc/
 ## Running Locally (WSL)
 
 ```bash
-# Server (from repo root)
-npm install
-cp .env.example .env
-npm run dev          # starts on :3000 (web) and :3001 (mcp)
-
-# Client (separate terminal)
-cd client
-npm install
-npm run dev          # starts on :5173
+npm run up           # server (:3000 web, :3001 mcp, auto-reload) + Vite UI (:5173)
+npm run up:prod      # build both, serve UI + API from :3000
 ```
+
+On Windows, `Vigil.cmd` (repo root) runs `scripts/vigil.sh dev --open` inside WSL.
+
+`scripts/vigil.sh` loads Node 20+ via nvm when the shell's node is older, runs
+`npm install` when `node_modules` is missing or older than the lockfile, creates `.env`,
+refuses to start if a port is taken, and supervises both processes: each runs in its
+own session (process group) with a watchdog, so Ctrl+C, one service exiting, or the
+launcher being killed stops everything. `.gitattributes` keeps `*.sh` LF and `*.cmd` CRLF.
+When the repo is on a Windows drive (`/mnt/*`) nodemon runs with `--legacy-watch`:
+inotify events don't cross into WSL2 there, so file watching must poll.
+
+Manual equivalent: `npm run dev` in the root and `npm run dev` in `client/`.
 
 **Claude Desktop / Claude Code MCP config:**
 ```json
